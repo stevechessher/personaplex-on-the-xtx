@@ -11,8 +11,9 @@ It's a homelab project: Proxmox, an LXC container with the XTX passed through, a
 | `moshi-patch/inject.patch` | A patch to moshi.cpp v0.8.0-beta. It adds a forced-text queue to `moshi_lmgen_step` and `SAY` / `PAUSE` / `CLEAR` commands on stdin (`--inject-stdin`). |
 | `moshi-patch/build.sh` | Builds only `libmoshi` and `personaplex` in a throwaway `ubuntu:24.04` container, against the release's own ggml libs. |
 | `bridge/bridge.py`, `bridge/index.html` | A WebSocket bridge and browser page: talk to PersonaPlex from a phone or laptop. You can pick the model (q8 / q4 / bf16) and the voice, and switch the brain on or off. |
-| `bridge/brain.py` | The **brain**: VAD → speech-to-text → LLM (PASS / answer / web search / weather) → `SAY` into PersonaPlex. |
-| `brain/stt_server.py` | A small HTTP service with faster-whisper STT (CPU), DuckDuckGo search (`ddgs`) and Open-Meteo weather. |
+| `bridge/brain.py`, `bridge/numwords.py` | The **brain**: VAD → streaming speech-to-text → LLM (PASS / answer / web search / weather) → `SAY` into PersonaPlex. |
+| `asr/Dockerfile` | Runs NVIDIA's [NeMo-Speech.cpp](https://github.com/NVIDIA/NeMo-Speech.cpp) streaming ASR (Nemotron Speech Streaming 0.6B) on the XTX over Vulkan. |
+| `brain/stt_server.py` | A small HTTP service: faster-whisper STT (CPU fallback), DuckDuckGo search (`ddgs`) and Open-Meteo weather. |
 | `tools/bf16gguf.py`, `tools/verify_bf16.py` | A streaming bf16 GGUF writer. It turns a 77 s load into 12 s without the ~27 GB of RAM moshi.cpp's own `-g` writer needs. |
 | `tools/gguftypes.py`, `tools/voice_bf16_to_f32.py` | A dependency-free GGUF tensor-type lister, and a converter for voice embeddings (RADV has no bf16→f32 copy). |
 | `tools/builder` | "Builder mode" for the Proxmox host: frees RAM and VRAM for experiments, and restores everything afterwards. |
@@ -30,7 +31,23 @@ Copy `bridge/brain.example.json` to `bridge/brain.json` (git-ignored) and set yo
 | q8_0 (local conversion) | 29.8–30.5 | 9.3 GB | 5–7 s |
 | bf16 (full size) | 22.5–22.8 | 16.8 GB | 12 s with our GGUF (77 s from safetensors) |
 
-With the brain on, the answer is queued about **1.9 s** after you stop talking for plain questions, and **3.7–4 s** for web or weather lookups. That's after a 0.7 s end-of-speech wait, and speech-to-text takes about 1.3 s of it.
+With the brain on, and counting from the 0.7 s end-of-speech wait:
+- the answer is queued about **0.5–1 s** later for plain questions;
+- about **2.3–3.5 s** later for web or weather lookups;
+- PASS (small talk) is released about **0.4 s** later.
+
+Speech-to-text is streamed while you talk, so it adds only 0–150 ms. The first version used faster-whisper after you stopped, which took about 1.3 s.
+
+### Streaming ASR on AMD (NeMo-Speech.cpp v0.1.0, Vulkan)
+
+| | whisper small.en (CPU, after you stop) | Nemotron streaming 0.6B (XTX, Vulkan) |
+|---|---|---|
+| words appear | only after you stop | 0.1–0.2 s after each word |
+| final text after speech end | ~1.3 s (+0.7 s VAD) | ~0.6 s (server endpointing at 500 ms) |
+| PersonaPlex q8 speed with it running | — | 27.8 → 27.6 fps (real time is 12.5) |
+| VRAM | 0 | ~1.2 GB |
+
+**RADV gotcha:** the prebuilt Linux Vulkan archive bundles an old `libstdc++.so.6`, which stops Mesa's RADV driver from loading, so ggml silently finds only the CPU ("no matching GPU device"). Rename `lib/libstdc++.so.6` and `lib/libgcc_s.so.1` in the install to `*.bundled`, and the XTX shows up.
 
 ## How the injection works
 
@@ -45,8 +62,10 @@ Moshi-family models produce a text token every 80 ms frame (the inner monologue)
 - PersonaPlex answers **instantly and confidently, and it's often wrong**. A stricter role prompt made this worse. Holding it silent until the LLM has decided (PASS lets it go) fixed it.
 - Mark PersonaPlex's own lines as **unreliable** in the LLM's transcript. Otherwise the LLM builds on its made-up topics.
 - Have the LLM **write numbers as words** ("ninety-eight degrees"). With digits, the audio sometimes said a different number from the forced text (2 % → "20 %", 98 → "78").
+- Streaming ASR spells numbers out ("two fifteen"), and the LLM (reasoning off) then got time math wrong. `numwords.py` converts them to digits. The LLM also writes its working as `CALC: … SAY: …`, and only the SAY part is spoken; that took a 7-question arithmetic set from mostly wrong to 7/7 for +0.2–0.8 s.
+- "When in doubt, PASS" made the LLM pass on real questions once PersonaPlex had started (wrongly) answering. "PASS only for pure small talk" fixed it.
 - A filler ("Let me check.") without a forced silence afterwards teaches PersonaPlex to invent its own "lookup results".
 
 ## Status
 
-This is an experiment, not a product. Weights aren't included: PersonaPlex is gated on Hugging Face under NVIDIA's license. `moshi-patch/inject.patch` modifies [moshi.cpp](https://github.com/Codes4Fun/moshi.cpp) (MIT, © Codes4Fun).
+This is an experiment, not a product. Weights aren't included: PersonaPlex is gated on Hugging Face under NVIDIA's license. `moshi-patch/inject.patch` modifies [moshi.cpp](https://github.com/Codes4Fun/moshi.cpp) (MIT, © Codes4Fun). The Nemotron ASR model is under the NVIDIA Open Model License; NeMo-Speech.cpp is Apache-2.0.

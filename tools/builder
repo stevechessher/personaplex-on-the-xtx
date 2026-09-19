@@ -20,7 +20,7 @@ LOG=$STATE_DIR/builder.log
 CT_XTX=101
 VM_R9700=100
 VMS_TO_STOP="103"                          # service VMs stopped in builder mode
-KEEP_CONTAINERS="pplex"                    # CT 101 containers left running
+KEEP_CONTAINERS="pplex nsserve"                   # CT 101 containers left running
 CT_XTX_BUILDER_MEM=26624                   # CT 101 memory cap (MB) under --all
 mkdir -p "$STATE_DIR"
 

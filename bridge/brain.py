@@ -17,6 +17,14 @@ service's /search) while the voice says "Let me check", then ask the LLM again w
 Settings (brain.json next to this file, or BRAIN_<NAME> env vars): {"home": "City, State"}
 is the default place for weather questions and tells the LLM where the person lives.
 
+rev 8 (2026-09-19): the LLM writes its arithmetic as "CALC: ... SAY: ..." (we speak only the SAY
+part): with Qwen3.6 reasoning off, one-shot time math was wrong (3:05, "ten seventy five"); with the
+working it got 7/7. "When in doubt, PASS" was replaced: it made the LLM pass on real questions.
+Spelled-out numbers are turned into digits before the LLM sees them.
+Speech-to-text is NVIDIA's streaming Nemotron ASR (NeMo-Speech.cpp on the XTX,
+Vulkan). The mic audio is streamed to it continuously, so when the VAD says you're done the text is
+already there (~0.6 s after your last word instead of ~2 s). Falls back to whisper if it's down.
+
 rev 7 (2026-09-19): VOICE lines are marked unreliable (PersonaPlex invents topics and the
 brain was building on them); hard 2-sentence cap; web search; 500 ms pre-roll so the first
 word of an utterance isn't clipped.
@@ -32,6 +40,8 @@ from pathlib import Path
 
 import numpy as np
 import aiohttp
+
+from numwords import normalize_numbers   # "two fifteen" -> "2:15" before the LLM sees it
 
 STT_URL = "http://192.168.1.174:8996/stt?rate=24000"
 LLM_URL = "http://192.168.1.176:4000/v1/chat/completions"
@@ -63,6 +73,9 @@ MAX_SENTENCES = 2
 HOLD_FRAMES = 100                  # 8 s of forced silence after "Let me check." while we look it up;
                                    # the answer's CLEAR ends it early. Without it PersonaPlex keeps
                                    # talking and invents its own "lookup" results (braintest_C).
+ASR_WS = _setting("asr_ws", "ws://172.17.0.1:8997/v1/audio/transcriptions/realtime")  # "" = whisper only
+ASR_EOU_MS = 500                   # server-side end-of-utterance; finals land before our 700 ms VAD fires
+ASR_WAIT_S = 0.6                   # at turn end, wait at most this long for the last final
 HOME = _setting("home")             # e.g. "Austin, Texas": default place for weather; "" = ask
 TURN_HOLD_FRAMES = 50              # when you finish speaking, keep PersonaPlex quiet (forced silence,
                                    # 4 s max) until the brain has decided: PASS releases it, an answer
@@ -86,7 +99,8 @@ told the voice to say.
 Look at the person's LAST utterance and reply with exactly one of:
 1. PASS  - greetings, small talk, chit-chat about their day or mood, thanks, acknowledgements,
    or the utterance looks cut off, garbled or unfinished. The voice handles chat fine on its own.
-   When in doubt, PASS.
+   PASS only for pure small talk. Any question (facts, numbers, math, times, advice) gets
+   an answer from you, even if the VOICE already started replying.
 2. WEATHER: <city, state>  - weather, temperature, rain or a forecast (a season-long outlook is
    a SEARCH instead).
    SEARCH: <short web search query>  - they need other current or live information: sports,
@@ -95,7 +109,10 @@ Look at the person's LAST utterance and reply with exactly one of:
    a decision. At most two short sentences, under 35 words, warm and plain spoken English.
    No lists, markdown, emojis or stage directions. Write numbers and times as spoken words (two percent, ninety-eight degrees, four oh five), never digits.
    If the person is confused by or objects to something the VOICE said, apologize in a few
-   words and steer back to what THEY asked, in one sentence."""
+   words and steer back to what THEY asked, in one sentence.
+If the answer needs any arithmetic, times or dates, first write your working on one line starting
+with CALC: (step by step, in digits), then on the next line write SAY: followed by what the voice
+should say."""
 
 
 
@@ -132,6 +149,12 @@ class Brain:
         self.turn = 0
         self.voice_t = 0.0             # when PersonaPlex last produced a word
         self.tasks = set()
+        # streaming ASR state
+        self.asr_q = asyncio.Queue(maxsize=500)    # 20 ms frames = 10 s of backlog at most
+        self.asr_ok = False
+        self.asr_finals = []
+        self.asr_partial = ""
+        self.asr_task = asyncio.create_task(self._asr_loop()) if ASR_WS else None
 
     # --- inputs from the bridge ----------------------------------------------------
     def on_voice_text(self, text):
@@ -140,6 +163,11 @@ class Brain:
             self.voice_t = time.monotonic()
 
     def feed(self, pcm):
+        if self.asr_task is not None:
+            try:
+                self.asr_q.put_nowait(bytes(pcm))
+            except asyncio.QueueFull:
+                pass
         a = np.frombuffer(pcm, np.int16).astype(np.float32) / 32768.0
         if not len(a):
             return
@@ -189,6 +217,55 @@ class Brain:
         if not self.ws.closed:
             await self.ws.send_json({"type": "brain", **kw})
 
+    async def _asr_loop(self):
+        """Keep one streaming-ASR websocket open for the whole conversation; reconnect on failure."""
+        while True:
+            try:
+                async with self.http.ws_connect(ASR_WS, heartbeat=20, timeout=5) as ws:
+                    await ws.receive()                                  # session.created
+                    await ws.send_json({"type": "session.update",
+                                        "session": {"sample_rate": 24000, "endpointing_ms": ASR_EOU_MS}})
+                    while not self.asr_q.empty():                       # drop audio from before we connected
+                        self.asr_q.get_nowait()
+                    self.asr_ok = True
+                    self.log("brain: streaming ASR connected")
+
+                    async def sender():
+                        while True:
+                            await ws.send_bytes(await self.asr_q.get())
+                    st = asyncio.create_task(sender())
+                    try:
+                        async for m in ws:
+                            if m.type != aiohttp.WSMsgType.TEXT:
+                                continue
+                            j = json.loads(m.data)
+                            ty = j.get("type", "")
+                            if ty.endswith("transcription.delta"):
+                                self.asr_partial += j.get("delta", "")
+                            elif ty.endswith("transcription.completed"):
+                                t = (j.get("transcript") or j.get("text") or "").strip()
+                                if t:
+                                    self.asr_finals.append(t)
+                                self.asr_partial = ""
+                    finally:
+                        st.cancel()
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                if self.asr_ok:
+                    self.log(f"brain: streaming ASR lost ({e!r}); using whisper until it's back")
+            self.asr_ok = False
+            await asyncio.sleep(3)
+
+    async def _asr_text(self):
+        """The streamed transcript for the turn that just ended (waits briefly for the final)."""
+        t0 = time.monotonic()
+        while self.asr_partial.strip() and time.monotonic() - t0 < ASR_WAIT_S:
+            await asyncio.sleep(0.02)
+        text = " ".join(self.asr_finals + [self.asr_partial.strip()]).strip()
+        self.asr_finals, self.asr_partial = [], ""
+        return text, round((time.monotonic() - t0) * 1000)
+
     async def _stt(self, seg):
         async with self.http.post(STT_URL, data=seg) as r:
             j = await r.json()
@@ -203,7 +280,7 @@ class Brain:
                 out.append(f"{r}: {t}")
         return "\n".join(out)
 
-    async def _chat(self, user, max_tokens=160):
+    async def _chat(self, user, max_tokens=240):
         home_line = f"The person lives in {HOME}, unless they say otherwise.\n" if HOME else ""
         sysmsg = SYSTEM.format(today=datetime.now().strftime("%A, %B %-d, %Y"), home_line=home_line)
         body = {"model": LLM_MODEL, "temperature": 0.0, "max_tokens": max_tokens,
@@ -214,7 +291,9 @@ class Brain:
             j = await r.json()
         out = (j.get("choices") or [{}])[0].get("message", {}).get("content") or ""
         out = re.sub(r"<think>.*?</think>", "", out, flags=re.S).strip()
-        return re.sub(r"\s+", " ", out.replace("*", "")).strip()
+        out = re.sub(r"\s+", " ", out.replace("*", "")).strip()
+        m = re.search(r"SAY:\s*(.+)", out)          # drop the CALC: working, keep what to say
+        return m.group(1).strip() if m else out
 
     async def _llm(self):
         return await self._chat(f"Transcript:\n{self._transcript()}\n\n"
@@ -255,7 +334,13 @@ class Brain:
 
     async def _handle(self, seg, turn, t_end):
         try:
-            text, stt_ms = await self._stt(seg)
+            text, stt_ms, stt_src = "", None, "whisper"
+            if self.asr_ok:
+                text, stt_ms = await self._asr_text()
+                stt_src = "nemotron"
+            if not text:                                    # ASR down or heard nothing: whisper
+                text, stt_ms = await self._stt(seg)
+                stt_src = "whisper"
             if not text:
                 self._release(turn)
                 return
@@ -269,6 +354,7 @@ class Brain:
             if self.voice_buf.strip():
                 self.hist.append(("VOICE", self.voice_buf.strip()))
                 self.voice_buf = ""
+            text = normalize_numbers(text)
             self.hist.append(("USER", text))
             t_llm = time.monotonic()
             answer = await self._llm()
@@ -307,15 +393,17 @@ class Brain:
             total = round((time.monotonic() - t_end) * 1000)
             self.log(f"brain: heard={text!r}{f' search={searched!r}' if searched else ''}"
                      f" -> {'PASS' if passed else answer!r}"
-                     f"{' (stale)' if stale else ''} stt={stt_ms}ms llm={llm_ms}ms total={total}ms")
+                     f"{' (stale)' if stale else ''} stt={stt_ms}ms({stt_src}) llm={llm_ms}ms total={total}ms")
             await self._event(heard=text, said=None if passed else answer, stale=stale, search=searched,
-                              stt_ms=stt_ms, llm_ms=llm_ms, total_ms=total)
+                              stt_ms=stt_ms, stt=stt_src, llm_ms=llm_ms, total_ms=total)
         except Exception as e:                     # never take the conversation down
             self._release(turn)
             self.log(f"brain error: {e!r}")
             await self._event(error=str(e)[:200])
 
     async def close(self):
+        if self.asr_task is not None:
+            self.asr_task.cancel()
         for t in list(self.tasks):
             t.cancel()
         await self.http.close()
