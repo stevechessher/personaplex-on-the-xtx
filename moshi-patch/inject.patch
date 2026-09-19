@@ -1,0 +1,267 @@
+diff --git a/include/moshi/moshi.h b/include/moshi/moshi.h
+index 4423a01..0812e42 100644
+--- a/include/moshi/moshi.h
++++ b/include/moshi/moshi.h
+@@ -202,6 +202,13 @@ MOSHI_API int moshi_lm_is_active( moshi_lm_gen_t * gen );
+ MOSHI_API int moshi_lm_is_empty( moshi_lm_gen_t * gen );
+ MOSHI_API void moshi_lm_machine_reset( moshi_lm_gen_t * gen );
+ 
++// home-server patch: inject text into PersonaPlex's inner monologue (it speaks it in its own voice)
++MOSHI_API int  moshi_lm_force_text( moshi_lm_gen_t * gen, tokenizer_t * tok, const char * text );
++MOSHI_API void moshi_lm_force_mode( moshi_lm_gen_t * gen, int mode, int nudge );  // 1 strict, 2 paced
++MOSHI_API void moshi_lm_force_pause( moshi_lm_gen_t * gen, int frames );            // queue forced silence
++MOSHI_API int  moshi_lm_forced_pending( moshi_lm_gen_t * gen );
++MOSHI_API void moshi_lm_force_clear( moshi_lm_gen_t * gen );
++
+ // MARK: Misc
+ 
+ 
+diff --git a/src/moshi.cpp b/src/moshi.cpp
+index db71498..c3986a6 100644
+--- a/src/moshi.cpp
++++ b/src/moshi.cpp
+@@ -714,6 +714,8 @@ struct moshi_lm_gen_t {
+ 
+     moshi_lmmodel_states_t * lm_states;
+     moshi_lmgen_state_t * lmgen_state;
++
++    std::deque<int> forced_text;   // home-server patch: queued inner-monologue tokens
+ };
+ 
+ moshi_lm_gen_t * moshi_lm_generator( moshi_lm_t * lm ) {
+@@ -877,6 +879,7 @@ void moshi_lm_start( moshi_context_t * moshi, moshi_lm_gen_t * gen, float depth_
+         };
+         gen->lm_states = moshi_lmmodel_states( gen->state_ctx, gen->lm->model, NULL );
+     }
++    gen->lmgen.forced_text = &gen->forced_text;   // home-server patch
+     gen->lmgen_state = moshi_lmgen_state( gen->lm->model );
+     gen->state_ctx->alloc();
+     gen->state_ctx->init();
+@@ -897,6 +900,31 @@ void moshi_lm_start( moshi_context_t * moshi, moshi_lm_gen_t * gen, float depth_
+     }
+ }
+ 
++// home-server patch: text injection
++int moshi_lm_force_text( moshi_lm_gen_t * gen, tokenizer_t * tok, const char * text ) {
++    std::vector<int> ids;
++    tok->sp.Encode( text, &ids );
++    for ( auto id : ids ) gen->forced_text.push_back( id );
++    return (int) ids.size();
++}
++
++void moshi_lm_force_pause( moshi_lm_gen_t * gen, int frames ) {
++    for ( int i = 0; i < frames; i++ ) gen->forced_text.push_back( 3 );  // PAD
++}
++
++void moshi_lm_force_mode( moshi_lm_gen_t * gen, int mode, int nudge ) {
++    gen->lmgen.force_mode = mode;
++    gen->lmgen.force_nudge = nudge;
++}
++
++int moshi_lm_forced_pending( moshi_lm_gen_t * gen ) {
++    return (int) gen->forced_text.size();
++}
++
++void moshi_lm_force_clear( moshi_lm_gen_t * gen ) {
++    gen->forced_text.clear();
++}
++
+ void moshi_lm_send( moshi_lm_gen_t * gen, Entry * entry ) {
+     gen->machine_state->entries.push_back( *entry );
+ }
+diff --git a/src/moshi/models/lm.h b/src/moshi/models/lm.h
+index 92416bb..60c865d 100644
+--- a/src/moshi/models/lm.h
++++ b/src/moshi/models/lm.h
+@@ -773,6 +773,17 @@ struct moshi_lmgen_t {
+     // these are from the TTSModel callbacks on_text, on_audio
+     std::deque<int> * text_prefixes;
+     std::deque<std::vector<int>> * audio_prefixes;
++
++    // text injection (home-server patch): tokens queued by moshi_lm_force_text() replace the
++    // sampled inner-monologue token, so the model speaks OUR words in its own voice.
++    //   force_mode 1 = strict: one queued token every frame
++    //   force_mode 2 = paced : replace only when the model itself emits a word token (not PAD 3 /
++    //                          EPAD 0), so it keeps its own timing; if it pads for more than
++    //                          force_nudge frames while tokens wait, force an EPAD to start a word
++    std::deque<int> * forced_text = nullptr;
++    int force_mode = 2;
++    int force_nudge = 6;
++    int force_idle = 0;
+ };
+ 
+ bool moshi_lmgen_step(
+@@ -878,6 +889,31 @@ bool moshi_lmgen_step(
+     ggml_backend_tensor_get( lm_states->sampler_out, &text_token, 0, 4 );
+ #endif
+ 
++    // text injection hook (home-server patch)
++    if ( lmgen->forced_text && ! lmgen->forced_text->empty() ) {
++        const int PAD = 3, EPAD = 0;
++        int front = lmgen->forced_text->front();
++        if ( front == PAD || front == EPAD ) {
++            // queued pauses / word-starts are always forced: a PAD run breaks the model's own
++            // plan (it goes quiet), so the words that follow are spoken as injected
++            text_token = front;
++            lmgen->forced_text->pop_front();
++            lmgen->force_idle = 0;
++        } else if ( lmgen->force_mode == 1 ) {
++            text_token = lmgen->forced_text->front();
++            lmgen->forced_text->pop_front();
++        } else if ( text_token != PAD && text_token != EPAD ) {
++            text_token = lmgen->forced_text->front();
++            lmgen->forced_text->pop_front();
++            lmgen->force_idle = 0;
++        } else if ( text_token == PAD && ++lmgen->force_idle > lmgen->force_nudge ) {
++            text_token = EPAD;          // nudge: "a word starts next"
++            lmgen->force_idle = 0;
++        }
++    } else if ( lmgen->forced_text ) {
++        lmgen->force_idle = 0;
++    }
++
+     // on_text_hook
+     if ( machine ) {
+         if ( text_prefixes && text_prefixes->size() ) {
+diff --git a/tools/personaplex.cpp b/tools/personaplex.cpp
+index cbc01e7..328ea89 100644
+--- a/tools/personaplex.cpp
++++ b/tools/personaplex.cpp
+@@ -44,6 +44,16 @@ options:
+   -i FNAME                     talk to moshi from an audio file.
+             --delay            delay the audio file in frames (12.5 fps)
+ 
++home-server patch (text injection):
++            --inject-stdin     read "SAY <text>" / "CLEAR" lines from stdin while running
++            --inject-mode N    1 strict (token per frame), 2 paced (default, model timing)
++            --inject-nudge N   paced: PAD frames before forcing a word start (default 6)
++            --inject-at F TXT  offline test: inject TXT at frame F
++            --inject-pause N   queue N frames of forced silence before --inject-at text
++            --depth-temperature X  audio sampling temperature only (default 0.8)
++            --frames N         bench: number of frames (default 125)
++            --dump FILE        bench: write output audio as raw f32 mono 24 kHz
++
+ personaplex options:
+   -p PROMPT --prompt PROMPT    system prompt
+   -v NAME,  --voice NAME       either a filepath to an audio file, a saved
+@@ -82,6 +92,8 @@ void log_metrics() {
+ }
+ 
+ #include <signal.h>
++#include <fcntl.h>
++#include <unistd.h>
+ void signal_handler(int dummy) {
+     shutdown = true;
+ }
+@@ -108,6 +120,17 @@ int main(int argc, char *argv[]) {
+     const char * input = NULL;
+     int input_delay = 0;
+ 
++    // home-server patch: text injection + offline test helpers
++    int inject_mode = 2;          // 1 strict (one token per frame), 2 paced (model's own timing)
++    int inject_nudge = 6;         // paced: frames of PAD before forcing an EPAD
++    bool inject_stdin = false;    // read "SAY <text>" / "CLEAR" lines from stdin (non-blocking)
++    int inject_at = -1;           // offline test: inject inject_text at this frame
++    std::string inject_text = "";
++    int inject_pause = 0;         // frames of forced PAD queued before --inject-at text
++    float depth_temp_override = -1.f;
++    int bench_frames = 125;
++    const char * dump_path = NULL; // bench: write decoded audio as raw f32 mono 24 kHz
++
+     std::string personaplex_voice_filepath = "";
+     std::string personaplex_system_prompt = "";
+ 
+@@ -209,6 +232,14 @@ int main(int argc, char *argv[]) {
+             input_delay = std::stoi(argv[++i]);
+             continue;
+         }
++        if (arg == "--inject-mode" && i + 1 < argc) { inject_mode = std::stoi(argv[++i]); continue; }
++        if (arg == "--inject-nudge" && i + 1 < argc) { inject_nudge = std::stoi(argv[++i]); continue; }
++        if (arg == "--inject-stdin") { inject_stdin = true; continue; }
++        if (arg == "--inject-at" && i + 2 < argc) { inject_at = std::stoi(argv[++i]); inject_text = argv[++i]; continue; }
++        if (arg == "--frames" && i + 1 < argc) { bench_frames = std::stoi(argv[++i]); continue; }
++        if (arg == "--inject-pause" && i + 1 < argc) { inject_pause = std::stoi(argv[++i]); continue; }
++        if (arg == "--depth-temperature" && i + 1 < argc) { depth_temp_override = (float) std::stod(argv[++i]); continue; }
++        if (arg == "--dump" && i + 1 < argc) { dump_path = argv[++i]; continue; }
+         if (arg == "-b" || arg == "--bench")  {
+             bench = true;
+             continue;
+@@ -693,7 +724,16 @@ int main(int argc, char *argv[]) {
+     /////////////////////////
+ 
+     // model
++    if ( depth_temp_override >= 0 ) depth_temperature = depth_temp_override;
+     moshi_lm_start( moshi, gen, depth_temperature, text_temperature );
++    moshi_lm_force_mode( gen, inject_mode, inject_nudge );   // after start: start() resets lmgen
++    std::string stdin_buf;
++    if ( inject_stdin ) {
++        int fl = fcntl( 0, F_GETFL, 0 );
++        fcntl( 0, F_SETFL, fl | O_NONBLOCK );
++    }
++    FILE * dump_f = dump_path? fopen( dump_path, "wb" ) : NULL;
++    int frame_index = 0;
+ 
+     std::vector<int16_t> tokens(num_audio_codebooks);
+     int text_token;
+@@ -765,6 +805,36 @@ int main(int argc, char *argv[]) {
+             lm_start = ggml_time_us();
+         }
+ 
++        // home-server patch: text injection sources
++        if ( inject_at >= 0 && frame_index == inject_at ) {
++            if ( inject_pause > 0 ) moshi_lm_force_pause( gen, inject_pause );
++            int n = moshi_lm_force_text( gen, tok, inject_text.c_str() );
++            fprintf( stderr, "[inject] frame %d: %d tokens\n", frame_index, n );
++        }
++        if ( inject_stdin ) {
++            char rb[4096];
++            ssize_t r;
++            while ( ( r = read( 0, rb, sizeof(rb) ) ) > 0 ) stdin_buf.append( rb, r );
++            size_t nl;
++            while ( ( nl = stdin_buf.find('\n') ) != std::string::npos ) {
++                std::string line = stdin_buf.substr( 0, nl );
++                stdin_buf.erase( 0, nl + 1 );
++                if ( line.rfind( "SAY ", 0 ) == 0 ) {
++                    int n = moshi_lm_force_text( gen, tok, line.c_str() + 4 );
++                    fprintf( stderr, "[inject] frame %d: %d tokens queued (%d pending)\n",
++                        frame_index, n, moshi_lm_forced_pending( gen ) );
++                } else if ( line.rfind( "PAUSE ", 0 ) == 0 ) {
++                    int n = std::stoi( line.substr( 6 ) );
++                    moshi_lm_force_pause( gen, n );
++                    fprintf( stderr, "[inject] frame %d: pause %d frames\n", frame_index, n );
++                } else if ( line == "CLEAR" ) {
++                    moshi_lm_force_clear( gen );
++                    fprintf( stderr, "[inject] frame %d: cleared\n", frame_index );
++                }
++            }
++        }
++        frame_index++;
++
+         mimi_encode_receive( encoder, tokens.data() );
+         moshi_lm_send2( gen, tokens );
+ 
+@@ -774,6 +844,7 @@ int main(int argc, char *argv[]) {
+ 
+             if ( bench ) {
+                 mimi_decode_receive( decoder, blank.data() );
++                if ( dump_f ) fwrite( blank.data(), sizeof(float), blank.size(), dump_f );
+             } else {
+                 // sdl_get_frame can block, don't include in frame rate
+                 lm_delta_time += ggml_time_us() - lm_start;
+@@ -785,7 +856,7 @@ int main(int argc, char *argv[]) {
+             }
+             lm_delta_time += ggml_time_us() - lm_start;
+             lm_frames++;
+-            if ( bench && lm_frames >= 125 ) {
++            if ( bench && lm_frames >= bench_frames ) {
+                 break;
+             }
+ 
+@@ -807,6 +878,7 @@ int main(int argc, char *argv[]) {
+         }
+     }
+ 
++    if ( dump_f ) fclose( dump_f );
+     auto memory_delta = ggml.memory_free - device_memory_free( ggml.dev );
+     printf("\ndevice memory delta: %d MiB", (int)( memory_delta / 1024 / 1024 ) );
+ 

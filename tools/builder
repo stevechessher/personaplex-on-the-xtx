@@ -1,0 +1,164 @@
+#!/bin/bash
+# builder — switch the home server between "service" and "builder" mode.
+#
+#   builder status          what is running, free RAM / VRAM, current mode
+#   builder on [--all]      free resources for experiments
+#                             default: stop VM 103 + CT 101 service containers,
+#                                      shield VM 100 from the OOM killer
+#                             --all:   also shut down VM 100 (frees the R9700 + 12 GB RAM)
+#                                      and raise CT 101's memory cap to $CT_XTX_BUILDER_MEM MB (live)
+#                                      (may be run while already in default builder mode: escalates)
+#   builder off             restore exactly what 'on' stopped, then health-check it
+#
+# State lives in /root/builder/state (plain key=value). Nothing is deleted;
+# every action is a stop/start or a runtime oom_score_adj change.
+set -euo pipefail
+
+STATE_DIR=/root/builder
+STATE=$STATE_DIR/state
+LOG=$STATE_DIR/builder.log
+CT_XTX=101
+VM_R9700=100
+VMS_TO_STOP="103"                          # service VMs stopped in builder mode
+KEEP_CONTAINERS="pplex"                    # CT 101 containers left running
+CT_XTX_BUILDER_MEM=26624                   # CT 101 memory cap (MB) under --all
+mkdir -p "$STATE_DIR"
+
+log()  { echo "$(date '+%F %T') $*" | tee -a "$LOG"; }
+die()  { echo "error: $*" >&2; exit 1; }
+vm_running() { [ "$(qm status "$1" 2>/dev/null | awk '{print $2}')" = running ]; }
+kvm_pid()    { cat "/var/run/qemu-server/$1.pid" 2>/dev/null || true; }
+host_avail() { free -m | awk '/Mem:/{print $7}'; }
+xtx_vram()   { local u t; u=$(cat /sys/class/drm/card*/device/mem_info_vram_used 2>/dev/null | head -1)
+               t=$(cat /sys/class/drm/card*/device/mem_info_vram_total 2>/dev/null | head -1)
+               echo "$((u/1048576))/$((t/1048576)) MiB"; }
+ct_containers_running() { pct exec $CT_XTX -- docker ps --format '{{.Names}}' 2>/dev/null | sort; }
+
+load_state() { # safe key=value reader (no sourcing)
+  local k v
+  while IFS='=' read -r k v; do
+    case $k in since|vms_stopped|containers_stopped|r9700_stopped|r9700_oom_prev|ct_mem_prev) printf -v "$k" '%s' "$v";; esac
+  done < "$STATE"
+}
+
+http_check() { # name url
+  local c; c=$(curl -s -o /dev/null -m 5 -w '%{http_code}' "$2" || true)
+  printf '  %-22s %s\n' "$1" "${c:-000}"
+}
+
+status() {
+  local mode=service; [ -f "$STATE" ] && mode="BUILDER (since $(grep '^since=' "$STATE" | cut -d= -f2-))"
+  echo "mode:        $mode"
+  [ -f "$STATE" ] && grep -q '^r9700_stopped=1' "$STATE" && echo "             (--all: R9700 VM down, CT $CT_XTX cap $(pct config $CT_XTX | awk '/^memory:/{print $2}') MB)"
+  echo "host RAM:    $(host_avail) MB available of $(free -m | awk '/Mem:/{print $2}') MB"
+  echo "XTX VRAM:    $(xtx_vram) used"
+  echo "guests:"
+  qm list | awk 'NR>1{printf "  VM %-4s %-10s %s\n",$1,$2,$3}'
+  pct list | awk 'NR>1{printf "  CT %-4s %-10s %s\n",$1,$NF,$2}'
+  local p; p=$(kvm_pid $VM_R9700)
+  [ -n "$p" ] && echo "VM $VM_R9700 oom_score_adj: $(cat /proc/$p/oom_score_adj)"
+  echo "CT $CT_XTX containers: $(ct_containers_running | tr '\n' ' ')"
+}
+
+builder_on() {
+  local all=0; [ "${1:-}" = "--all" ] && all=1
+  local vms_stopped="" containers_stopped="" r9700_stopped=0 oom_prev="" ct_mem_prev="" since="" r9700_oom_prev=""
+  if [ -f "$STATE" ]; then
+    load_state
+    [ $all = 1 ] && [ "$r9700_stopped" = 0 ] || die "already in builder mode (see 'builder status'); run 'builder off' first"
+    oom_prev=${r9700_oom_prev:-}; ct_mem_prev=${ct_mem_prev:-}
+    log "builder ON escalating to --all"
+  else
+    since=$(date '+%F %T')
+    log "builder ON (all=$all) — host avail before: $(host_avail) MB, XTX $(xtx_vram)"
+    for vm in $VMS_TO_STOP; do
+      if vm_running "$vm"; then
+        log "shutting down VM $vm"
+        qm shutdown "$vm" --timeout 90 || { log "VM $vm clean shutdown timed out, stopping"; qm stop "$vm"; }
+        vms_stopped="$vms_stopped $vm"
+      fi
+    done
+    for c in $(ct_containers_running); do
+      case " $KEEP_CONTAINERS " in *" $c "*) continue;; esac
+      log "stopping container $c on CT $CT_XTX"
+      pct exec $CT_XTX -- docker stop -t 20 "$c" >/dev/null
+      containers_stopped="$containers_stopped $c"
+    done
+  fi
+
+  if [ $all = 1 ] && vm_running $VM_R9700; then
+    log "shutting down VM $VM_R9700 (R9700)"
+    qm shutdown $VM_R9700 --timeout 120 || { log "VM $VM_R9700 clean shutdown timed out, stopping"; qm stop $VM_R9700; }
+    r9700_stopped=1
+    ct_mem_prev=$(pct config $CT_XTX | awk '/^memory:/{print $2}')
+    pct set $CT_XTX -memory $CT_XTX_BUILDER_MEM
+    log "CT $CT_XTX memory cap $ct_mem_prev -> $CT_XTX_BUILDER_MEM MB"
+  elif [ $all = 0 ] && vm_running $VM_R9700; then
+    local p; p=$(kvm_pid $VM_R9700)
+    oom_prev=$(cat /proc/$p/oom_score_adj)
+    echo -1000 > /proc/$p/oom_score_adj
+    log "VM $VM_R9700 kvm pid $p shielded from OOM killer (oom_score_adj $oom_prev -> -1000)"
+  fi
+
+  cat > "$STATE" <<EOF2
+since=$since
+vms_stopped=${vms_stopped# }
+containers_stopped=${containers_stopped# }
+r9700_stopped=$r9700_stopped
+r9700_oom_prev=$oom_prev
+ct_mem_prev=$ct_mem_prev
+EOF2
+  log "builder ON complete — host avail now: $(host_avail) MB, XTX $(xtx_vram)"
+  status
+}
+
+builder_off() {
+  [ -f "$STATE" ] || die "not in builder mode"
+  local since="" vms_stopped="" containers_stopped="" r9700_stopped=0 r9700_oom_prev="" ct_mem_prev=""
+  load_state
+  log "builder OFF — restoring: vms=[$vms_stopped] containers=[$containers_stopped] r9700_stopped=$r9700_stopped"
+
+  if [ -n "${ct_mem_prev:-}" ]; then
+    pct set $CT_XTX -memory "$ct_mem_prev"; log "CT $CT_XTX memory cap restored to $ct_mem_prev MB"
+  fi
+  if [ "$r9700_stopped" = 1 ]; then
+    log "starting VM $VM_R9700"; qm start $VM_R9700
+  elif [ -n "${r9700_oom_prev:-}" ]; then
+    local p; p=$(kvm_pid $VM_R9700)
+    [ -n "$p" ] && echo "$r9700_oom_prev" > /proc/$p/oom_score_adj && log "VM $VM_R9700 oom_score_adj restored to $r9700_oom_prev"
+  fi
+  for c in $containers_stopped; do log "starting container $c"; pct exec $CT_XTX -- docker start "$c" >/dev/null; done
+  for vm in $vms_stopped; do log "starting VM $vm"; qm start "$vm"; done
+  rm -f "$STATE"
+
+  log "waiting for services..."
+  local deadline=$((SECONDS + 150))
+  while [ $SECONDS -lt $deadline ]; do
+    local ok=1
+    [ "$(curl -s -o /dev/null -m 3 -w '%{http_code}' http://192.168.1.113:8080/health || true)" = 200 ] || ok=0
+    for c in $containers_stopped; do
+      case $c in
+        kokoro)   [ "$(curl -s -o /dev/null -m 3 -w '%{http_code}' http://192.168.1.174:8880/v1/models || true)" = 200 ] || ok=0;;
+        voicebox) [ "$(curl -s -o /dev/null -m 3 -w '%{http_code}' http://192.168.1.174:17493/health || true)" = 200 ] || ok=0;;
+      esac
+    done
+    [ $ok = 1 ] && break
+    sleep 5
+  done
+  echo "health:"
+  http_check "r9700 llama-server"  http://192.168.1.113:8080/health
+  http_check "router (CT 102)"     http://192.168.1.176:4000/health/liveliness
+  http_check "open-webui"          http://192.168.1.176:3000/health
+  http_check "kokoro"              http://192.168.1.174:8880/v1/models
+  http_check "voicebox"            http://192.168.1.174:17493/health
+  http_check "personaplex bridge"  http://192.168.1.174:8998/health
+  http_check "livekit (VM 103)"    http://192.168.1.180:8080/healthz
+  log "builder OFF complete — host avail: $(host_avail) MB, XTX $(xtx_vram)"
+}
+
+case "${1:-status}" in
+  status) status ;;
+  on)     builder_on "${2:-}" ;;
+  off)    builder_off ;;
+  *)      sed -n '2,12p' "$0"; exit 1 ;;
+esac

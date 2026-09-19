@@ -1,0 +1,7 @@
+# local settings and secrets
+bridge/brain.json
+bridge/.litellm-key
+*.gguf
+*.safetensors
+__pycache__/
+core*

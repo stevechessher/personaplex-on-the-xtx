@@ -1,0 +1,187 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>PersonaPlex</title>
+<style>
+  :root { --bg:#111418; --fg:#e8eaed; --muted:#9aa0a6; --acc:#7cc4ff; --bad:#ff8a80; --ok:#8ce99a; --card:#1b1f24; }
+  * { box-sizing: border-box; }
+  body { margin:0; font:16px/1.45 system-ui, sans-serif; background:var(--bg); color:var(--fg); }
+  main { max-width:640px; margin:0 auto; padding:16px; }
+  h1 { font-size:20px; margin:0 0 12px; }
+  label { display:block; font-size:13px; color:var(--muted); margin:10px 0 4px; }
+  select, textarea { width:100%; background:var(--card); color:var(--fg); border:1px solid #333a42; border-radius:8px; padding:10px; font:inherit; }
+  textarea { min-height:72px; resize:vertical; }
+  .row { display:flex; gap:10px; margin-top:14px; }
+  button { flex:1; padding:14px; font-size:17px; border:0; border-radius:10px; background:var(--acc); color:#06121c; font-weight:600; }
+  button:disabled { opacity:.4; }
+  #stop { background:#3a4048; color:var(--fg); }
+  #status { margin-top:12px; font-size:14px; color:var(--muted); min-height:1.4em; }
+  #status.ok { color:var(--ok); } #status.bad { color:var(--bad); }
+  #meter { height:6px; background:var(--card); border-radius:3px; margin-top:10px; overflow:hidden; }
+  #meter div { height:100%; width:0; background:var(--acc); transition:width .08s; }
+  .chk { display:flex; align-items:center; gap:8px; margin-top:12px; font-size:15px; }
+  .chk input { width:20px; height:20px; }
+  .brain { color:var(--acc); font-size:13px; display:block; margin:6px 0; }
+  #log { margin-top:14px; background:var(--card); border-radius:10px; padding:12px; min-height:120px; white-space:pre-wrap; }
+  small { color:var(--muted); }
+</style>
+</head>
+<body>
+<main>
+  <h1>PersonaPlex on the XTX</h1>
+  <label for="model">Model</label>
+  <select id="model"><option value="q8">q8_0 — daily</option></select>
+  <label class="chk"><input type="checkbox" id="brain" disabled> Brain: R9700 Qwen 35B answers questions (<span id="brainstate">checking…</span>)</label>
+  <label for="voice">Voice</label>
+  <select id="voice"></select>
+  <label for="prompt">Role / system prompt (optional)</label>
+  <textarea id="prompt">You are a friendly, concise assistant. Keep answers short.</textarea>
+  <div class="row">
+    <button id="start">Start</button>
+    <button id="stop" disabled>Stop</button>
+  </div>
+  <div id="status">Idle. Headphones recommended — it listens while it talks.</div>
+  <div id="meter"><div></div></div>
+  <div id="log"></div>
+  <p><small>Full duplex: talk over it, interrupt it. One conversation at a time.</small></p>
+</main>
+<script>
+const RATE = 24000;
+const $ = (id) => document.getElementById(id);
+let ws = null, ctx = null, micStream = null, capNode = null, playNode = null;
+
+const workletSrc = `
+class Cap extends AudioWorkletProcessor {
+  constructor(){ super(); this.buf = new Float32Array(480); this.n = 0; }
+  process(inputs){
+    const ch = inputs[0] && inputs[0][0];
+    if (ch) for (let i = 0; i < ch.length; i++) {
+      this.buf[this.n++] = ch[i];
+      if (this.n === 480) { this.port.postMessage(this.buf.slice(0)); this.n = 0; }
+    }
+    return true;
+  }
+}
+class Play extends AudioWorkletProcessor {
+  constructor(){
+    super();
+    this.q = new Float32Array(${RATE} * 2); this.r = 0; this.w = 0; this.size = 0;
+    this.started = false; this.pre = ${RATE} * 0.06; this.max = ${RATE} * 0.4;
+    this.port.onmessage = (e) => {
+      const d = e.data;
+      for (let i = 0; i < d.length; i++) {
+        if (this.size >= this.q.length) { this.r = (this.r + 1) % this.q.length; this.size--; }
+        this.q[this.w] = d[i]; this.w = (this.w + 1) % this.q.length; this.size++;
+      }
+      while (this.size > this.max) { this.r = (this.r + 1) % this.q.length; this.size--; }
+    };
+  }
+  process(_i, outputs){
+    const out = outputs[0][0];
+    if (!this.started && this.size >= this.pre) this.started = true;
+    for (let i = 0; i < out.length; i++) {
+      if (this.started && this.size > 0) { out[i] = this.q[this.r]; this.r = (this.r + 1) % this.q.length; this.size--; }
+      else out[i] = 0;
+    }
+    if (this.size === 0) this.started = false;
+    return true;
+  }
+}
+registerProcessor('cap', Cap);
+registerProcessor('play', Play);`;
+
+function status(msg, cls) { const s = $('status'); s.textContent = msg; s.className = cls || ''; }
+
+async function loadHealth() {
+  try {
+    const h = await (await fetch('health')).json();
+    $('brain').disabled = !h.brain; $('brain').checked = !!h.brain;
+    $('brainstate').textContent = h.brain ? 'available' : 'unavailable';
+  } catch (e) { $('brainstate').textContent = 'unavailable'; }
+}
+
+async function loadVoices() {
+  try {
+    const r = await fetch('voices'); const j = await r.json();
+    const names = { q8: 'q8_0 — daily (9.3 GB VRAM, 30 fps)',
+                    q4: 'q4_k — lightest (5.4 GB VRAM, 34 fps)',
+                    full: 'full bf16 — 16.8 GB VRAM, 22.6 fps, ~15 s to load' };
+    $('model').innerHTML = (j.models || ['q4']).map(m => `<option value="${m}">${names[m] || m}</option>`).join('');
+    $('voice').innerHTML = j.voices.map(v => `<option${v === 'NATF0' ? ' selected' : ''}>${v}</option>`).join('');
+  } catch (e) { status('Could not load voices: ' + e, 'bad'); }
+}
+
+async function start() {
+  $('start').disabled = true; $('log').textContent = '';
+  try {
+    micStream = await navigator.mediaDevices.getUserMedia({ audio: {
+      channelCount: 1, echoCancellation: true, noiseSuppression: true, autoGainControl: true } });
+  } catch (e) { status('Microphone blocked: ' + e.message + ' (needs HTTPS)', 'bad'); $('start').disabled = false; return; }
+
+  ctx = new AudioContext({ sampleRate: RATE, latencyHint: 'interactive' });
+  const url = URL.createObjectURL(new Blob([workletSrc], { type: 'application/javascript' }));
+  await ctx.audioWorklet.addModule(url);
+  const src = ctx.createMediaStreamSource(micStream);
+  capNode = new AudioWorkletNode(ctx, 'cap');
+  playNode = new AudioWorkletNode(ctx, 'play', { outputChannelCount: [1] });
+  src.connect(capNode);
+  playNode.connect(ctx.destination);
+
+  const q = new URLSearchParams({ brain: $('brain').checked ? '1' : '0', model: $('model').value, voice: $('voice').value, prompt: $('prompt').value });
+  const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
+  ws = new WebSocket(`${proto}//${location.host}${location.pathname.replace(/[^/]*$/, '')}ws?${q}`);
+  ws.binaryType = 'arraybuffer';
+  let live = false;
+
+  capNode.port.onmessage = (e) => {
+    const f = e.data;
+    let peak = 0;
+    const s = new Int16Array(f.length);
+    for (let i = 0; i < f.length; i++) { const v = Math.max(-1, Math.min(1, f[i])); s[i] = v * 32767; peak = Math.max(peak, Math.abs(v)); }
+    $('meter').firstElementChild.style.width = Math.min(100, peak * 140) + '%';
+    if (live && ws.readyState === 1) ws.send(s.buffer);
+  };
+
+  ws.onmessage = (e) => {
+    if (typeof e.data === 'string') {
+      const m = JSON.parse(e.data);
+      if (m.type === 'status') status(m.message + '…');
+      else if (m.type === 'ready') { live = true; status(`Live — say hello (model loaded in ${m.load_s}s)`, 'ok'); }
+      else if (m.type === 'text') $('log').appendChild(document.createTextNode(m.data));
+      else if (m.type === 'brain') {
+        const d = document.createElement('span'); d.className = 'brain';
+        d.textContent = m.error ? `🧠 error: ${m.error}` : m.echo ? `🧠 (ignored own echo: “${m.heard}”)`
+          : `🧠 heard “${m.heard}” → ${m.said ? '“' + m.said + '”' : 'let it chat'}` +
+            (m.stale ? ' (dropped: you kept talking)' : '') + ` · ${m.total_ms} ms`;
+        $('log').appendChild(d);
+      }
+      else if (m.type === 'error') status(m.message, 'bad');
+      else if (m.type === 'ended') status('Model stopped (rc ' + m.rc + ')' + (live ? '' : ' — failed to load; q8 needs free VRAM (builder mode)'), 'bad');
+      return;
+    }
+    const s = new Int16Array(e.data), f = new Float32Array(s.length);
+    for (let i = 0; i < s.length; i++) f[i] = s[i] / 32768;
+    playNode.port.postMessage(f, [f.buffer]);
+  };
+  ws.onclose = () => { teardown(); if (!$('status').className) status('Disconnected'); };
+  ws.onerror = () => status('Connection error', 'bad');
+  $('stop').disabled = false;
+}
+
+function teardown() {
+  if (micStream) micStream.getTracks().forEach(t => t.stop());
+  if (ctx) ctx.close();
+  micStream = ctx = capNode = playNode = null;
+  $('start').disabled = false; $('stop').disabled = true;
+  $('meter').firstElementChild.style.width = '0';
+}
+
+$('start').onclick = start;
+$('stop').onclick = () => { if (ws && ws.readyState === 1) ws.send('stop'); if (ws) ws.close(); status('Stopped'); };
+loadVoices();
+loadHealth();
+</script>
+</body>
+</html>
