@@ -34,6 +34,8 @@
   <label for="model">Model</label>
   <select id="model"><option value="q8">q8_0 — daily</option></select>
   <label class="chk"><input type="checkbox" id="brain" disabled> Brain: R9700 Qwen 35B answers questions (<span id="brainstate">checking…</span>)</label>
+  <label for="pace">Pace: how long it waits for you to finish: <span id="paceval">1.0×</span> (snappy ← → relaxed)</label>
+  <input type="range" id="pace" min="0.5" max="2.5" step="0.1" value="1.0" style="width:100%">
   <label for="voice">Voice</label>
   <select id="voice"></select>
   <label for="prompt">Role / system prompt (optional)</label>
@@ -129,7 +131,7 @@ async function start() {
   src.connect(capNode);
   playNode.connect(ctx.destination);
 
-  const q = new URLSearchParams({ brain: $('brain').checked ? '1' : '0', model: $('model').value, voice: $('voice').value, prompt: $('prompt').value });
+  const q = new URLSearchParams({ brain: $('brain').checked ? '1' : '0', model: $('model').value, voice: $('voice').value, prompt: $('prompt').value, pace: $('pace').value });
   const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
   ws = new WebSocket(`${proto}//${location.host}${location.pathname.replace(/[^/]*$/, '')}ws?${q}`);
   ws.binaryType = 'arraybuffer';
@@ -152,6 +154,7 @@ async function start() {
       else if (m.type === 'text') $('log').appendChild(document.createTextNode(m.data));
       else if (m.type === 'brain') {
         const d = document.createElement('span'); d.className = 'brain';
+        if (m.pace) { $('pace').value = m.pace; $('paceval').textContent = (+m.pace).toFixed(1) + '×'; try { localStorage.setItem('pp_pace', m.pace); } catch (e) {} }
         d.textContent = m.error ? `🧠 error: ${m.error}` : m.echo ? `🧠 (ignored own echo: “${m.heard}”)`
           : `🧠 heard “${m.heard}” → ${m.said ? '“' + m.said + '”' : 'let it chat'}` +
             (m.stale ? ' (dropped: you kept talking)' : '') + ` · ${m.total_ms} ms`;
@@ -179,6 +182,14 @@ function teardown() {
 }
 
 $('start').onclick = start;
+(function () {
+  try { const v = localStorage.getItem('pp_pace'); if (v) { $('pace').value = v; $('paceval').textContent = (+v).toFixed(1) + '×'; } } catch (e) {}
+  $('pace').oninput = () => {
+    const v = $('pace').value; $('paceval').textContent = (+v).toFixed(1) + '×';
+    try { localStorage.setItem('pp_pace', v); } catch (e) {}
+    if (typeof ws !== 'undefined' && ws && ws.readyState === 1) ws.send(JSON.stringify({ type: 'pace', value: +v }));
+  };
+})();
 $('stop').onclick = () => { if (ws && ws.readyState === 1) ws.send('stop'); if (ws) ws.close(); status('Stopped'); };
 loadVoices();
 loadHealth();

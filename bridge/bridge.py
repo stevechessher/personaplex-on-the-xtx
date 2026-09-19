@@ -138,6 +138,10 @@ async def ws_handler(req):
     prompt = (req.query.get("prompt") or "").strip()[:MAX_PROMPT]
     seed = req.query.get("seed")
     use_brain = req.query.get("brain") == "1" and brain_ok()
+    try:
+        pace = min(2.5, max(0.5, float(req.query.get("pace", "1"))))
+    except ValueError:
+        pace = 1.0
 
     if session_lock.locked():
         await ws.send_json({"type": "error", "message": "busy: another conversation is running"})
@@ -167,7 +171,7 @@ async def ws_handler(req):
         errlog = open("/tmp/personaplex-stderr.log", "ab")
         model = await spawn(*cmd, stdout=asyncio.subprocess.PIPE, stderr=errlog, env=env,
                             stdin=asyncio.subprocess.PIPE if use_brain else None)
-        br = brain.Brain(ws, model.stdin, log) if use_brain else None
+        br = brain.Brain(ws, model.stdin, log, pace=pace) if use_brain else None
         t0 = time.monotonic()
         tasks = []
 
@@ -217,6 +221,13 @@ async def ws_handler(req):
                         br.feed(msg.data)
                 elif msg.type == WSMsgType.TEXT and msg.data == "stop":
                     break
+                elif msg.type == WSMsgType.TEXT and br and msg.data.startswith("{"):
+                    try:
+                        j = json.loads(msg.data)
+                        if j.get("type") == "pace":
+                            br.set_pace(j.get("value", 1.0))
+                    except (ValueError, TypeError):
+                        pass
                 elif msg.type == WSMsgType.ERROR:
                     break
         except (ConnectionResetError, BrokenPipeError) as e:

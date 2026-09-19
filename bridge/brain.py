@@ -17,6 +17,15 @@ service's /search) while the voice says "Let me check", then ask the LLM again w
 Settings (brain.json next to this file, or BRAIN_<NAME> env vars): {"home": "City, State"}
 is the default place for weather questions and tells the LLM where the person lives.
 
+rev 9b (2026-09-19): "what can you do?" gets a fixed answer from code (the LLM PASSed it as small
+talk twice and PersonaPlex invented "I only do time questions"); a misunderstanding gets a question back.
+
+rev 9 (2026-09-19): human-paced turn-taking. The end-of-turn wait depends on whether you sound finished
+(the streaming ASR's punctuation and your last word): ~0.6 s after a finished sentence, ~1.6 s after
+"and", "the", "I"... PersonaPlex is held quiet during those thinking pauses. A pace setting (page
+slider, or say "wait longer" / "you can go faster") scales it. The LLM is told what it can and can't do,
+and how to handle "that's not what I meant" (Steve's 12:33 session looped on "web page").
+
 rev 8 (2026-09-19): the LLM writes its arithmetic as "CALC: ... SAY: ..." (we speak only the SAY
 part): with Qwen3.6 reasoning off, one-shot time math was wrong (3:05, "ten seventy five"); with the
 working it got 7/7. "When in doubt, PASS" was replaced: it made the LLM pass on real questions.
@@ -64,7 +73,22 @@ def _setting(name, default=""):
 
 FRAME_S = 0.02                     # the browser sends 20 ms chunks
 START_FRAMES = 3                   # 60 ms above threshold = speech started
-END_FRAMES = 35                    # 700 ms below threshold = utterance over
+END_CLEAR_S = 0.6                  # silence before "done" when you sound finished (ends in . ? !)
+END_UNSURE_S = 1.0                 # ... when we have no transcript to judge by
+END_OPEN_S = 1.6                   # ... when you trailed off ("and", "the", no punctuation yet)
+PACE_MIN, PACE_MAX = 0.5, 2.5      # multiplies all three; page slider / voice commands
+TRAILING = set("""a an the and or but so because if that which who to of in on at for with from about
+    like as than then my your our their his her its i i'm we you they he she it is are was were be
+    um uh er well just really very also""".split())
+MORE_TIME = re.compile(r"\b(wait (a (bit|little|second|sec) )?longer|give me (a (bit|little|second|sec)|more time|a moment)|"
+                       r"let me finish|stop interrupting|don'?t interrupt|you'?re (cutting me off|interrupting)|"
+                       r"(wait|pause) (on|for) my pauses|slow down)\b", re.I)
+ABILITIES = re.compile(r"\bwhat (can|could) you (do|help( me)? with)\b|\bwhat (are you|you'?re) able to do\b|"
+                       r"\byour (abilities|capabilities)\b|\bwhat are you capable of\b", re.I)
+ABILITIES_SAY = ("I can answer questions, do math, look up news, sports and other current info, and check the weather. "
+                 "I can't open a specific web page, see your screen or send messages.")
+LESS_TIME = re.compile(r"\b(you can (go|answer|respond) faster|speed (it )?up|respond (quicker|faster)|"
+                       r"you'?re (too slow|slow to answer))\b", re.I)
 MIN_UTT_S = 0.35
 MAX_UTT_S = 30.0
 MAX_TURNS = 16
@@ -87,6 +111,10 @@ TAIL_HOLD_FRAMES = 25              # 2 s of silence after a brain answer, so Per
 PAUSE_FRAMES = 16                  # 80 ms each; used only when the voice is mid-sentence
 
 SYSTEM = """You are the thinking brain behind a real-time spoken voice assistant. Today is {today}.
+What this assistant CAN do: answer questions from general knowledge, do math, look up current
+information on the web (news, sports, prices, schedules) and get weather forecasts. What it CANNOT do:
+open or read a specific web page or link, see a screen, send messages, or remember past conversations.
+When asked about its abilities, answer from this list in one or two short sentences.
 {home_line}A small speech model (the VOICE) does the actual talking. It sounds natural but it knows very
 little and constantly makes things up: it invents topics, facts and names nobody mentioned.
 
@@ -99,7 +127,7 @@ told the voice to say.
 Look at the person's LAST utterance and reply with exactly one of:
 1. PASS  - greetings, small talk, chit-chat about their day or mood, thanks, acknowledgements,
    or the utterance looks cut off, garbled or unfinished. The voice handles chat fine on its own.
-   PASS only for pure small talk. Any question (facts, numbers, math, times, advice) gets
+   PASS only for pure small talk. Any question (facts, numbers, math, times, advice, what the assistant can do) gets
    an answer from you, even if the VOICE already started replying.
 2. WEATHER: <city, state>  - weather, temperature, rain or a forecast (a season-long outlook is
    a SEARCH instead).
@@ -110,6 +138,10 @@ Look at the person's LAST utterance and reply with exactly one of:
    No lists, markdown, emojis or stage directions. Write numbers and times as spoken words (two percent, ninety-eight degrees, four oh five), never digits.
    If the person is confused by or objects to something the VOICE said, apologize in a few
    words and steer back to what THEY asked, in one sentence.
+   If the person says you misunderstood ("that's not what I meant", "I'm not talking about X"),
+   say sorry in a few words and ASK what they meant (end with a question); do not guess or
+   list abilities. Never bring X up again yourself.
+   If they tell you HOW to talk (yes or no only, shorter, slower), do it and say so briefly.
 If the answer needs any arithmetic, times or dates, first write your working on one line starting
 with CALC: (step by step, in digits), then on the next line write SAY: followed by what the voice
 should say."""
@@ -135,8 +167,10 @@ def _words(s):
 
 
 class Brain:
-    def __init__(self, ws, stdin, log):
+    def __init__(self, ws, stdin, log, pace=1.0):
         self.ws, self.stdin, self.log = ws, stdin, log
+        self.pace = min(PACE_MAX, max(PACE_MIN, float(pace)))
+        self.listen_hold = False       # PersonaPlex held quiet during the current thinking pause
         self.http = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=20))
         self.hist = []                 # (role, text): USER / VOICE / BRAIN
         self.voice_buf = ""            # PersonaPlex text since the last user turn
@@ -155,6 +189,25 @@ class Brain:
         self.asr_finals = []
         self.asr_partial = ""
         self.asr_task = asyncio.create_task(self._asr_loop()) if ASR_WS else None
+
+    # --- pacing ------------------------------------------------------------------------
+    def set_pace(self, v):
+        self.pace = min(PACE_MAX, max(PACE_MIN, float(v)))
+        self.log(f"brain: pace {self.pace:.1f}x")
+
+    def _turn_text(self):
+        return (" ".join(self.asr_finals) + " " + self.asr_partial).strip() if self.asr_ok else ""
+
+    def _end_s(self):
+        """How much silence ends this turn: short if you sound finished, long if you trailed off."""
+        text = self._turn_text()
+        if not text:
+            base = END_UNSURE_S
+        else:
+            last = re.findall(r"[a-z']+", text.lower())[-1:] or [""]
+            finished = text.rstrip()[-1:] in ".?!" and not self.asr_partial.strip()
+            base = END_CLEAR_S if finished and last[0] not in TRAILING else END_OPEN_S
+        return base * self.pace
 
     # --- inputs from the bridge ----------------------------------------------------
     def on_voice_text(self, text):
@@ -187,9 +240,19 @@ class Brain:
         else:
             self.cur += pcm
             self.below = self.below + 1 if rms < thr else 0
+            if self.below == 0:
+                self.listen_hold = False
             dur = len(self.cur) / 2 / 24000
-            if self.below >= END_FRAMES or dur > MAX_UTT_S:
+            end_s = self._end_s()
+            silent_s = self.below * FRAME_S
+            if not self.listen_hold and silent_s >= END_CLEAR_S * self.pace * 0.6 and end_s > silent_s:
+                # a thinking pause: keep PersonaPlex from jumping in while we wait to see if you go on
+                self.listen_hold = True
+                self._send_model("CLEAR")
+                self._send_model(f"PAUSE {int((end_s - silent_s) / 0.08) + 4}")
+            if silent_s >= end_s or dur > MAX_UTT_S:
                 self.in_speech, self.above = False, 0
+                self.listen_hold = False
                 seg = bytes(self.cur)
                 self.cur = bytearray()
                 self.pre.clear()
@@ -355,6 +418,29 @@ class Brain:
                 self.hist.append(("VOICE", self.voice_buf.strip()))
                 self.voice_buf = ""
             text = normalize_numbers(text)
+            if ABILITIES.search(text) and len(text.split()) <= 14:
+                # the 35B kept PASSing this as small talk, and PersonaPlex then made up its own limits
+                if turn == self.turn:
+                    self._say(ABILITIES_SAY)
+                    self._send_model(f"PAUSE {TAIL_HOLD_FRAMES}")
+                self.hist += [("USER", text), ("BRAIN", ABILITIES_SAY)]
+                self.log(f"brain: heard={text!r} -> abilities")
+                await self._event(heard=text, said=ABILITIES_SAY, stt_ms=stt_ms, stt=stt_src,
+                                  total_ms=round((time.monotonic() - t_end) * 1000))
+                return
+            if MORE_TIME.search(text) or LESS_TIME.search(text):
+                more = bool(MORE_TIME.search(text))
+                self.set_pace(self.pace + (0.4 if more else -0.3))
+                reply = ("Got it, I'll give you more time to finish." if more
+                         else "Okay, I'll jump in a little sooner.")
+                if turn == self.turn:
+                    self._say(reply)
+                    self._send_model(f"PAUSE {TAIL_HOLD_FRAMES}")
+                self.hist += [("USER", text), ("BRAIN", reply)]
+                self.log(f"brain: heard={text!r} -> pace {self.pace:.1f}x")
+                await self._event(heard=text, said=reply, pace=round(self.pace, 1), stt_ms=stt_ms, stt=stt_src,
+                                  total_ms=round((time.monotonic() - t_end) * 1000))
+                return
             self.hist.append(("USER", text))
             t_llm = time.monotonic()
             answer = await self._llm()

@@ -18,6 +18,8 @@ It's a homelab project: Proxmox, an LXC container with the XTX passed through, a
 | `tools/gguftypes.py`, `tools/voice_bf16_to_f32.py` | A dependency-free GGUF tensor-type lister, and a converter for voice embeddings (RADV has no bf16→f32 copy). |
 | `tools/builder` | "Builder mode" for the Proxmox host: frees RAM and VRAM for experiments, and restores everything afterwards. |
 | `tests/brain_test.py`, `tests/stt_reply.py` | An end-to-end test. Kokoro TTS speaks questions into the bridge in real time, and the reply audio is transcribed. |
+| `tests/brain_test_pace.py` | The same, for turn-taking: a sentence with a 1.1 s pause in the middle, "what can you do?", "that's not what I meant", and "wait a little longer". |
+| `tools/tts_ttfa.py` | Time to first audio for any OpenAI-style `/v1/audio/speech` endpoint (streamed PCM). |
 
 ## Settings
 
@@ -31,7 +33,7 @@ Copy `bridge/brain.example.json` to `bridge/brain.json` (git-ignored) and set yo
 | q8_0 (local conversion) | 29.8–30.5 | 9.3 GB | 5–7 s |
 | bf16 (full size) | 22.5–22.8 | 16.8 GB | 12 s with our GGUF (77 s from safetensors) |
 
-With the brain on, and counting from the 0.7 s end-of-speech wait:
+With the brain on, and counting from the end-of-turn wait (see Turn-taking below):
 - the answer is queued about **0.5–1 s** later for plain questions;
 - about **2.3–3.5 s** later for web or weather lookups;
 - PASS (small talk) is released about **0.4 s** later.
@@ -49,6 +51,29 @@ Speech-to-text is streamed while you talk, so it adds only 0–150 ms. The first
 
 **RADV gotcha:** the prebuilt Linux Vulkan archive bundles an old `libstdc++.so.6`, which stops Mesa's RADV driver from loading, so ggml silently finds only the CPU ("no matching GPU device"). Rename `lib/libstdc++.so.6` and `lib/libgcc_s.so.1` in the install to `*.bundled`, and the XTX shows up.
 
+### Text-to-speech on the XTX (for a cascade instead of PersonaPlex)
+
+Kokoro-82M, [Kokoro-FastAPI](https://github.com/remsky/Kokoro-FastAPI) ROCm image, on the XTX (+1.4 GB VRAM), PersonaPlex not running:
+
+| text | first audio | all audio |
+|---|---|---|
+| 5 words (1.7 s of speech) | 179 ms | 179 ms |
+| 2 sentences (9.3 s of speech) | 308 ms | 309 ms |
+
+The whole reply arrives at once, about 30× faster than real time, so sentence-by-sentence streaming wouldn't gain anything here.
+
+## Turn-taking (brain rev 9)
+
+A fixed 0.7 s silence cut people off mid-thought and made answers come faster than people talk. Now the wait depends on whether you *sound* finished, using the streaming ASR's punctuation and your last word:
+
+- **~0.6 s** after a finished sentence ("…when do I get there?");
+- **~1.6 s** after a trailing word ("and", "the", "I", "um") or no punctuation yet;
+- **~1.0 s** when there's no transcript to judge by.
+
+PersonaPlex is held quiet during those thinking pauses. A **pace** setting (0.5–2.5×) scales all three: there's a slider on the page, or you can say "wait a little longer" / "you can go faster".
+
+In the test, a 1.1 s pause mid-sentence stayed one turn in one run out of two (Kokoro's own padding makes the real gap nearer 1.6 s). When it splits, the first half is dropped as stale and the answer still comes out right.
+
 ## How the injection works
 
 Moshi-family models produce a text token every 80 ms frame (the inner monologue), and the audio codebooks are conditioned on it. The patch overrides that sampled text token from a queue:
@@ -65,6 +90,8 @@ Moshi-family models produce a text token every 80 ms frame (the inner monologue)
 - Streaming ASR spells numbers out ("two fifteen"), and the LLM (reasoning off) then got time math wrong. `numwords.py` converts them to digits. The LLM also writes its working as `CALC: … SAY: …`, and only the SAY part is spoken; that took a 7-question arithmetic set from mostly wrong to 7/7 for +0.2–0.8 s.
 - "When in doubt, PASS" made the LLM pass on real questions once PersonaPlex had started (wrongly) answering. "PASS only for pure small talk" fixed it.
 - A filler ("Let me check.") without a forced silence afterwards teaches PersonaPlex to invent its own "lookup results".
+- The LLM (reasoning off) kept treating "what can you do?" as small talk and passing it, even with a capabilities list in its prompt. PersonaPlex then invented its own limits ("I only answer time questions"). A regex and a fixed answer fixed it.
+- "That's not what I meant" needs a question back ("What did you mean?"), not a guess. Otherwise the conversation loops on the wrong topic.
 
 ## Status
 
